@@ -1,0 +1,33 @@
+[project]
+name = "uc2canopen"
+version = "0.1.0"
+description = "Python CANopen master for openUC2 microscope hardware — control motors, lasers, LEDs, galvos directly over CAN bus via Waveshare USB-CAN-A adapter"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "openUC2 GmbH", email = "info@openuc2.com" }]
+requires-python = ">=3.10"
+dependencies = [
+    "pyserial>=3.5",
+    "python-can>=4.0",
+]
+
+[project.optional-dependencies]
+canopen = ["canopen>=2.0"]          # optional: for EDS-based SDO access
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+uc2can = "uc2canopen.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/openUC2/uc2-esp32"
+Documentation = "https://openuc2.github.io"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/uc2canopen"]
+
+[tool.ruff]
+line-length = 100
