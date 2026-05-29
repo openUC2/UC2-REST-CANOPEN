@@ -148,6 +148,21 @@ class WaveshareBus(BusABC):
         self._ser.flush()
         time.sleep(0.1)  # Wait for adapter to apply settings
 
+        # Waveshare USB-CAN-A swallows the first CAN frame transmitted after
+        # _configure_speed. Confirmed via passive bus sniffer: a write to
+        # 0x60B issued right after init never appears on the wire, while
+        # every later frame does. Prime the adapter with a harmless RTR to
+        # ID 0x7FF DL=0 — no node responds, and losing it is fine.
+        primer = bytes([
+            FRAME_START,
+            TYPE_STANDARD | TYPE_REMOTE | 0x00,  # std, RTR, DL=0
+            0xFF, 0x07,                          # ID 0x7FF, little-endian
+            FRAME_END,
+        ])
+        self._ser.write(primer)
+        self._ser.flush()
+        time.sleep(0.02)
+
     def _encode_frame(self, msg: Message) -> bytes:
         """Encode a CAN message to Waveshare serial format."""
         type_byte = TYPE_STANDARD if not msg.is_extended_id else TYPE_EXTENDED
