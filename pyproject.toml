@@ -1,7 +1,7 @@
 [project]
 name = "uc2canopen"
 version = "0.1.0"
-description = "Python CANopen master for openUC2 microscope hardware — control motors, lasers, LEDs, galvos directly over CAN bus via Waveshare USB-CAN-A adapter"
+description = "Python CANopen master for openUC2 microscope hardware — control motors, lasers, LEDs, galvos directly over CAN bus (SocketCAN MCP2515 HAT or Waveshare USB-CAN-A adapter)"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "openUC2 GmbH", email = "info@openuc2.com" }]

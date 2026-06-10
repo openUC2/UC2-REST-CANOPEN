@@ -375,14 +375,25 @@ class UC2Client:
     Similar to UC2-REST's UC2Client but communicates over CAN instead of serial.
 
     Args:
-        port: serial port of the Waveshare USB-CAN-A adapter
-              (auto-detected if None)
-        bitrate: CAN bus bitrate (default 500 kbit/s, must match firmware)
+        interface: CAN transport — "socketcan" for a Linux SocketCAN device
+            (e.g. an MCP2515 SPI HAT that enumerates as `can0`), or "waveshare"
+            for a USB-CAN-A serial adapter. If None (default), picks "waveshare"
+            when `port` is given, otherwise "socketcan".
+        channel: SocketCAN interface name (default "can0"). Used when
+            interface == "socketcan".
+        port: serial port of the Waveshare USB-CAN-A adapter (auto-detected if
+            None). Used when interface == "waveshare".
+        bitrate: CAN bus bitrate. For SocketCAN this is configured at the OS
+            level (`ip link set <channel> up type can bitrate <N>`) and ignored
+            here; for the Waveshare adapter it is applied. Must match firmware.
         serial_baudrate: Waveshare adapter serial speed (default 2 Mbit/s)
         sdo_timeout: SDO transfer timeout in seconds
 
     Example:
-        uc2 = UC2Client(port="/dev/ttyUSB0")
+        # MCP2515 HAT (after `sudo ip link set can0 up type can bitrate 500000`)
+        uc2 = UC2Client()                       # interface="socketcan", channel="can0"
+        # or a Waveshare USB-CAN-A adapter:
+        # uc2 = UC2Client(port="/dev/ttyUSB0")
         uc2.motor.move(axis=0, position=1000, speed=20000, node_id=10)
         uc2.motor.wait_for_idle(axis=0, node_id=10)
         pos = uc2.motor.get_position(axis=0, node_id=10)
@@ -399,27 +410,41 @@ class UC2Client:
         serial_baudrate: int = 2_000_000,
         sdo_timeout: float = 2.0,
         sdo_settle_s: float = 0.010,
-        interface: str = "waveshare",
+        interface: Optional[str] = None,
+        channel: Optional[str] = None,
         debug: bool = False,
     ):
-        # Auto-detect port if not specified
-        if port is None:
-            port = find_waveshare_port()
-            if port is None:
-                raise RuntimeError(
-                    "No Waveshare USB-CAN-A adapter found. "
-                    "Pass port= explicitly or check USB connection."
-                )
+        # Pick a transport. Default to SocketCAN (e.g. an MCP2515 HAT) unless a
+        # Waveshare serial port was given.
+        if interface is None:
+            interface = "waveshare" if port is not None else "socketcan"
 
         # Open the CAN bus
         if interface == "socketcan":
-            self._bus = can.interface.Bus(interface="socketcan", channel="can0")
-        else:
+            # MCP2515 HAT etc. The bitrate is configured at the OS level with
+            # `ip link set <channel> up type can bitrate <N>`, not here.
+            self._bus = can.interface.Bus(
+                interface="socketcan",
+                channel=channel or "can0",
+            )
+        elif interface == "waveshare":
+            # Auto-detect the serial port if not specified.
+            if port is None:
+                port = find_waveshare_port()
+                if port is None:
+                    raise RuntimeError(
+                        "No Waveshare USB-CAN-A adapter found. "
+                        "Pass port= explicitly or check USB connection."
+                    )
             self._bus = WaveshareBus(
                 channel=port,
                 bitrate=bitrate,
                 serial_baudrate=serial_baudrate,
                 debug=debug,
+            )
+        else:
+            raise ValueError(
+                f"Unknown interface {interface!r}; use 'socketcan' or 'waveshare'."
             )
 
         # Create transport layers (both implement can.Listener; the shared
@@ -454,4 +479,5 @@ class UC2Client:
         self.close()
 
     def __repr__(self):
-        return f"UC2Client(port={self._bus.channel!r}, bus={self._bus!r})"
+        chan = getattr(self._bus, "channel", None) or getattr(self._bus, "channel_info", "?")
+        return f"UC2Client(channel={chan!r}, bus={type(self._bus).__name__})"

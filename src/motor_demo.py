@@ -3,7 +3,8 @@
 UC2 CANopen motor control example.
 
 Demonstrates the high-level Python API for controlling UC2 motors,
-lasers, and LEDs via a Waveshare USB-CAN-A adapter.
+lasers, and LEDs over CAN — either an MCP2515 SPI HAT (SocketCAN,
+the default) or a Waveshare USB-CAN-A adapter.
 
 This replaces the old UC2-REST serial JSON interface with direct
 CANopen SDO communication — same API shape, different transport.
@@ -11,10 +12,13 @@ CANopen SDO communication — same API shape, different transport.
 Usage:
     # Install the package first:
     uv pip install -e .
-    # Auto-detect adapter:
-    python src/motor_demo.py
-    # Specify port + nodes:
-    python /Users/bene/Dropbox/Dokumente/Promotion/PROJECTS/UC2-REST-CANOPEN/src/motor_demo.py --port /dev/cu.usbserial-10 --motor-node 11 
+
+    # MCP2515 SPI HAT (SocketCAN): bring the interface up once, then run:
+    sudo ip link set can0 up type can bitrate 500000 restart-ms 100
+    python src/motor_demo.py --motor-node 11
+
+    # Waveshare USB-CAN-A adapter instead:
+    python src/motor_demo.py --interface waveshare --port /dev/ttyUSB0 --motor-node 11
 """
 
 from __future__ import annotations
@@ -24,18 +28,29 @@ import sys
 import time
 import traceback
 
+import can
+
 from uc2canopen import NODE, SdoError, UC2Client
 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="UC2 CANopen motor/laser/LED demo")
     p.add_argument(
+        "--interface", "-i", default=None, choices=["socketcan", "waveshare"],
+        help="CAN transport. Default: socketcan (MCP2515 HAT), or waveshare if --port is given.",
+    )
+    p.add_argument(
+        "--channel", "-c", default="can0",
+        help="SocketCAN interface name (default: can0). Used with --interface socketcan.",
+    )
+    p.add_argument(
         "--port", "-p", default=None,
-        help="Waveshare USB-CAN-A serial port. Default: auto-detect "
-             "(scans /dev/ttyUSB*, /dev/ttyACM*, /dev/cu.usbserial-*, /dev/cu.wchusbserial*).",
+        help="Waveshare USB-CAN-A serial port (implies --interface waveshare). Default: "
+             "auto-detect (/dev/ttyUSB*, /dev/ttyACM*, /dev/cu.usbserial-*, /dev/cu.wchusbserial*).",
     )
     p.add_argument("--bitrate", "-b", type=int, default=500_000,
-                   help="CAN bus bitrate (default 500000 — must match firmware)")
+                   help="CAN bitrate, must match firmware (default 500000). For SocketCAN it is "
+                        "set via `ip link`; used here only for the error hint.")
     p.add_argument("--motor-node", type=int, default=NODE.MOT_X,
                    help=f"Motor CAN node ID (default {NODE.MOT_X} = NODE.MOT_X)")
     p.add_argument("--laser-node", type=int, default=NODE.LED_0,
@@ -115,14 +130,21 @@ def main() -> int:
 
     try:
         uc2 = UC2Client(
+            interface=args.interface,
+            channel=args.channel,
             port=args.port,
             bitrate=args.bitrate,
             sdo_settle_s=args.sdo_settle_ms / 1000.0,
             debug=args.debug,
-            interface="socketcan"
         )
-    except (RuntimeError, OSError) as e:
+    except (RuntimeError, OSError, can.CanError) as e:
         print(f"Failed to open CAN bus: {e}", file=sys.stderr)
+        if (args.interface or "socketcan") == "socketcan" and not args.port:
+            print(
+                f"  Is '{args.channel}' up? Bring it up with:\n"
+                f"    sudo ip link set {args.channel} up type can bitrate {args.bitrate} restart-ms 100",
+                file=sys.stderr,
+            )
         return 1
     print(f"Connected: {uc2}")
 

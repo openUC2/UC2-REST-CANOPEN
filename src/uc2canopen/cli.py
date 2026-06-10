@@ -24,8 +24,18 @@ from .od import NODE
 from .waveshare_bus import WaveshareBus, find_waveshare_port
 
 
+def _client(args) -> UC2Client:
+    """Build a UC2Client from the shared --interface/--channel/--port options."""
+    return UC2Client(
+        interface=args.interface,
+        channel=args.channel,
+        port=args.port,
+        bitrate=args.bitrate,
+    )
+
+
 def cmd_scan(args):
-    with UC2Client(port=args.port, bitrate=args.bitrate) as uc2:
+    with _client(args) as uc2:
         print(f"Scanning for nodes ({args.timeout}s)...")
         nodes = uc2.state.scan_nodes(timeout=args.timeout)
         if nodes:
@@ -35,7 +45,7 @@ def cmd_scan(args):
 
 
 def cmd_move(args):
-    with UC2Client(port=args.port, bitrate=args.bitrate) as uc2:
+    with _client(args) as uc2:
         print(f"Moving motor: node={args.node} axis={args.axis} "
               f"pos={args.pos} speed={args.speed} abs={args.abs_}")
         uc2.motor.move(
@@ -55,13 +65,13 @@ def cmd_move(args):
 
 
 def cmd_stop(args):
-    with UC2Client(port=args.port, bitrate=args.bitrate) as uc2:
+    with _client(args) as uc2:
         uc2.motor.stop(axis=args.axis, node_id=args.node)
         print(f"Stop sent to node {args.node} axis {args.axis}")
 
 
 def cmd_home(args):
-    with UC2Client(port=args.port, bitrate=args.bitrate) as uc2:
+    with _client(args) as uc2:
         print(f"Homing: node={args.node} axis={args.axis}")
         uc2.motor.home(
             axis=args.axis,
@@ -75,13 +85,13 @@ def cmd_home(args):
 
 
 def cmd_laser(args):
-    with UC2Client(port=args.port, bitrate=args.bitrate) as uc2:
+    with _client(args) as uc2:
         uc2.laser.set_value(channel=args.ch, pwm=args.pwm, node_id=args.node)
         print(f"Laser ch={args.ch} pwm={args.pwm} on node {args.node}")
 
 
 def cmd_led(args):
-    with UC2Client(port=args.port, bitrate=args.bitrate) as uc2:
+    with _client(args) as uc2:
         if args.off:
             uc2.led.off(node_id=args.node)
             print(f"LED off on node {args.node}")
@@ -91,7 +101,7 @@ def cmd_led(args):
 
 
 def cmd_status(args):
-    with UC2Client(port=args.port, bitrate=args.bitrate) as uc2:
+    with _client(args) as uc2:
         try:
             uptime = uc2.state.get_uptime(args.node)
             heap = uc2.state.get_free_heap(args.node)
@@ -107,13 +117,18 @@ def cmd_status(args):
 
 
 def cmd_sniff(args):
-    port = args.port or find_waveshare_port()
-    if not port:
-        print("No Waveshare adapter found.", file=sys.stderr)
-        sys.exit(1)
-
-    bus = WaveshareBus(channel=port, bitrate=args.bitrate)
-    print(f"Sniffing CAN bus on {port} @ {args.bitrate // 1000}k. Ctrl+C to stop.\n")
+    iface = args.interface or ("waveshare" if args.port else "socketcan")
+    if iface == "socketcan":
+        bus = can.interface.Bus(interface="socketcan", channel=args.channel)
+        where = args.channel
+    else:
+        port = args.port or find_waveshare_port()
+        if not port:
+            print("No Waveshare adapter found.", file=sys.stderr)
+            sys.exit(1)
+        bus = WaveshareBus(channel=port, bitrate=args.bitrate)
+        where = port
+    print(f"Sniffing CAN bus on {where}. Ctrl+C to stop.\n")
 
     FC_NAMES = {
         0x000: "NMT", 0x080: "SYNC", 0x180: "TPDO1", 0x200: "RPDO1",
@@ -139,7 +154,7 @@ def cmd_sniff(args):
 
 
 def cmd_reboot(args):
-    with UC2Client(port=args.port, bitrate=args.bitrate) as uc2:
+    with _client(args) as uc2:
         uc2.state.reboot(args.node)
         print(f"Reboot command sent to node {args.node}")
 
@@ -149,7 +164,12 @@ def main():
         prog="uc2can",
         description="UC2 CANopen command-line tool — control motors, lasers, LEDs over CAN",
     )
-    p.add_argument("--port", "-p", default=None, help="Waveshare serial port (auto-detected)")
+    p.add_argument("--interface", "-i", default=None, choices=["socketcan", "waveshare"],
+                   help="CAN transport. Default: socketcan (MCP2515 HAT), or waveshare if --port is given.")
+    p.add_argument("--channel", "-c", default="can0",
+                   help="SocketCAN interface name (default can0; used with --interface socketcan)")
+    p.add_argument("--port", "-p", default=None,
+                   help="Waveshare serial port (implies --interface waveshare; auto-detected)")
     p.add_argument("--bitrate", "-b", type=int, default=500_000, help="CAN bitrate (default 500k)")
 
     sub = p.add_subparsers(dest="cmd", required=True)
