@@ -399,6 +399,7 @@ class UC2Client:
         serial_baudrate: int = 2_000_000,
         sdo_timeout: float = 2.0,
         sdo_settle_s: float = 0.010,
+        interface: str = "waveshare",
         debug: bool = False,
     ):
         # Auto-detect port if not specified
@@ -411,12 +412,15 @@ class UC2Client:
                 )
 
         # Open the CAN bus
-        self._bus = WaveshareBus(
-            channel=port,
-            bitrate=bitrate,
-            serial_baudrate=serial_baudrate,
-            debug=debug,
-        )
+        if interface == "socketcan":
+            self._bus = can.interface.Bus(interface="socketcan", channel="can0")
+        else:
+            self._bus = WaveshareBus(
+                channel=port,
+                bitrate=bitrate,
+                serial_baudrate=serial_baudrate,
+                debug=debug,
+            )
 
         # Create transport layers (both implement can.Listener; the shared
         # Notifier dispatches every received frame to BOTH so SDO and PDO

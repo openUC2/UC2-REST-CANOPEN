@@ -119,6 +119,7 @@ def main() -> int:
             bitrate=args.bitrate,
             sdo_settle_s=args.sdo_settle_ms / 1000.0,
             debug=args.debug,
+            interface="socketcan"
         )
     except (RuntimeError, OSError) as e:
         print(f"Failed to open CAN bus: {e}", file=sys.stderr)
