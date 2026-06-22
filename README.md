@@ -113,7 +113,7 @@ install for the HAT. (`pyserial` is pulled in too, only needed for the
 Waveshare adapter.)
 
 ```bash
-pip install UC2-REST-CANOPEN
+pip install uc2canopen
 ```
 ---
 
