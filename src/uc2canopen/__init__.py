@@ -12,6 +12,12 @@ Quick start:
     uc2.close()
 """
 
+import logging
+
+# Library best practice: attach a NullHandler so log records are silently
+# discarded unless the application configures a handler.
+logging.getLogger(__name__).addHandler(logging.NullHandler())
+
 from .client import UC2Client
 from .od import OD, NODE
 from .sdo import SdoClient, SdoError

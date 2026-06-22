@@ -17,6 +17,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import struct
 import threading
 import time
@@ -28,6 +29,8 @@ import can
 from .od import OD, NODE
 from .sdo import SdoClient, SdoError
 from .waveshare_bus import WaveshareBus, find_waveshare_port
+
+_log = logging.getLogger(__name__)
 
 # TPDO1 COB-ID base
 TPDO1_BASE = 0x180
@@ -191,10 +194,12 @@ class Motor:
         nid = node_id or self.default_node
         sub = axis + 1  # OD sub-indices are 1-based
 
-        print(f"Motor move: node {nid} axis {axis} → pos {position} at {speed} steps/s with OD: sub {sub}, accel {acceleration}, absolute {is_absolute}, forever {is_forever}")
+        _log.debug("Motor move: node %d axis %d -> pos %d at %d steps/s "
+                   "(sub=%d accel=%d absolute=%s forever=%s)",
+                   nid, axis, position, speed, sub, acceleration, is_absolute, is_forever)
         self._sdo.write_i32(nid, OD.MOTOR_TARGET_POSITION, sub, position)
-        
-        print(f"Setting speed {speed} steps/s for node {nid} axis {axis} (OD sub {sub})")
+        _log.debug("Setting speed %d steps/s for node %d axis %d (OD sub %d)",
+                   speed, nid, axis, sub)
         self._sdo.write_u32(nid, OD.MOTOR_SPEED, sub, speed)
         
         if acceleration > 0:
@@ -412,8 +417,13 @@ class UC2Client:
         sdo_settle_s: float = 0.010,
         interface: Optional[str] = None,
         channel: Optional[str] = None,
-        debug: bool = False,
+        log_level: int = logging.WARNING,
     ):
+        # Configure the package-wide logger so all sub-modules (sdo, waveshare_bus)
+        # honour the same level. The caller controls verbosity; we never install
+        # a handler — that is the application's responsibility.
+        logging.getLogger("uc2canopen").setLevel(log_level)
+
         # Pick a transport. Default to SocketCAN (e.g. an MCP2515 HAT) unless a
         # Waveshare serial port was given.
         if interface is None:
@@ -440,7 +450,6 @@ class UC2Client:
                 channel=port,
                 bitrate=bitrate,
                 serial_baudrate=serial_baudrate,
-                debug=debug,
             )
         else:
             raise ValueError(

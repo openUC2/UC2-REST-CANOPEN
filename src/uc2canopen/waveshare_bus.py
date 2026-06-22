@@ -19,6 +19,7 @@ References:
     - https://github.com/RajithaRanasinghe/Python-Class-for-Waveshare-USB-CAN-A
 """
 import glob
+import logging
 import struct
 import sys
 import threading
@@ -27,6 +28,8 @@ from typing import Optional
 
 import serial
 from can import BusABC, Message
+
+_log = logging.getLogger(__name__)
 
 
 # Serial-port glob patterns to scan for a Waveshare USB-CAN-A adapter.
@@ -88,7 +91,6 @@ class WaveshareBus(BusABC):
         channel: str,
         bitrate: int = 1000000,
         serial_baudrate: int = 2000000,
-        debug: bool = True,
         **kwargs
     ):
         """
@@ -98,14 +100,12 @@ class WaveshareBus(BusABC):
             channel: Serial port (e.g., '/dev/ttyUSB0', '/dev/ttyUSB1')
             bitrate: CAN bus bitrate (default 1000000 for Piper arm)
             serial_baudrate: Serial port baudrate (default 2000000)
-            debug: If True, print every raw serial chunk and decoded frame.
         """
         super().__init__(channel=channel, **kwargs)
 
         self.channel = channel
         self.bitrate = bitrate
         self.serial_baudrate = serial_baudrate
-        self.debug = debug
 
         # Open serial port
         self._ser = serial.Serial(
@@ -223,8 +223,7 @@ class WaveshareBus(BusABC):
     def send(self, msg: Message, timeout: Optional[float] = None) -> None:
         """Send a CAN message."""
         frame = self._encode_frame(msg)
-        if self.debug:
-            print(f"[WS TX] serial bytes: {frame.hex(' ')}  ({msg})")
+        _log.debug("[WS TX] serial bytes: %s  (%s)", frame.hex(' '), msg)
         self._ser.write(frame)
         self._ser.flush()
 
@@ -255,8 +254,8 @@ class WaveshareBus(BusABC):
 
                         msg = self._decode_frame(frame_data)
                         if msg:
-                            if self.debug:
-                                print(f"[WS RX frame] id=0x{msg.arbitration_id:03X} dlc={len(msg.data)} data={bytes(msg.data).hex(' ')}")
+                            _log.debug("[WS RX frame] id=0x%03X dlc=%d data=%s",
+                                       msg.arbitration_id, len(msg.data), bytes(msg.data).hex(' '))
                             return msg, False
 
                 # Read more data from serial
@@ -270,8 +269,7 @@ class WaveshareBus(BusABC):
                 self._ser.timeout = min(remaining, 0.1)
                 chunk = self._ser.read(256)
                 if chunk:
-                    if self.debug:
-                        print(f"[WS RX raw] {chunk.hex(' ')}")
+                    _log.debug("[WS RX raw] %s", chunk.hex(' '))
                     self._recv_buffer.extend(chunk)
                 elif timeout is not None and time.time() >= deadline:
                     return None, False

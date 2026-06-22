@@ -10,6 +10,7 @@ CiA 301 compliant for expedited transfers (≤ 4 bytes).
 
 from __future__ import annotations
 
+import logging
 import struct
 import threading
 import time
@@ -19,6 +20,8 @@ import can
 from can import Listener
 
 from .od import OD, SDO_TYPES, ODEntry
+
+_log = logging.getLogger(__name__)
 
 
 # CAN COB-ID conventions (CiA 301)
@@ -125,7 +128,9 @@ class SdoClient(Listener):
     def on_message_received(self, msg: can.Message) -> None:
         # Called by can.Notifier from its single RX thread.
         is_sdo = (msg.arbitration_id & 0x780) == SDO_RX_BASE
-        print(f"[SDO listener] id=0x{msg.arbitration_id:03X} data={bytes(msg.data).hex(' ')} {'<-- SDO MATCH' if is_sdo else ''}")
+        _log.debug("[SDO listener] id=0x%03X data=%s%s",
+                   msg.arbitration_id, bytes(msg.data).hex(' '),
+                   ' <-- SDO MATCH' if is_sdo else '')
         if is_sdo:
             self._pending_response = msg
             self._response_event.set()
@@ -169,7 +174,8 @@ class SdoClient(Listener):
         payload[0] = cmd
         struct.pack_into("<HB", payload, 1, index, sub)
         payload[4:4+size] = data
-        print(f"SDO write: node {node_id} idx 0x{index:04X}:{sub} = {data.hex()} (cmd 0x{cmd:02X})")
+        _log.debug("SDO write: node %d idx 0x%04X:%d = %s (cmd 0x%02X)",
+                   node_id, index, sub, data.hex(), cmd)
         with self._lock:
             self._response_event.clear()
             self._pending_response = None
@@ -179,7 +185,7 @@ class SdoClient(Listener):
                 data=bytes(payload),
                 is_extended_id=False,
             )
-            print(f"Sending SDO download request to node {node_id} with frame: {frame}")
+            _log.debug("Sending SDO download request to node %d: %s", node_id, frame)
             self.bus.send(frame)
 
             if not self._response_event.wait(timeout=self.timeout_s):
