@@ -1,6 +1,6 @@
 [project]
 name = "uc2canopen"
-version = "0.1.2"
+version = "0.1.3"
 description = "Python CANopen master for openUC2 microscope hardware — control motors, lasers, LEDs, galvos directly over CAN bus (SocketCAN MCP2515 HAT or Waveshare USB-CAN-A adapter)"
 readme = "README.md"
 license = { text = "MIT" }
