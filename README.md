@@ -151,8 +151,35 @@ uc2.laser.set_value(channel=0, pwm=512, node_id=NODE.LASER_0)   # laser 50%
 uc2.led.fill(r=255, g=0, b=0, node_id=NODE.LED_0)               # LEDs red
 print(f"Uptime: {uc2.state.get_uptime(NODE.MOT_X)}s")
 
+# Galvo scanner: centre, raster scan, stop
+uc2.galvo.set_position(2048, 2048, node_id=NODE.GALVO)
+uc2.galvo.raster_scan(nx=128, ny=128, sample_period_us=2, node_id=NODE.GALVO)
+uc2.galvo.stop(node_id=NODE.GALVO)
+
 uc2.close()
 ```
+
+### Device modules
+
+`UC2Client` exposes one controller per firmware device class (all mirror the
+CANopen Object Dictionary in `od.py`):
+
+| Module | Highlights |
+|---|---|
+| `uc2.motor` | `move`, `home`/`wait_for_homed`, `get_homing_status`, `set_soft_limits`, `configure_tmc`, `set_hardlimit` |
+| `uc2.laser` | `set_value`, `set_pwm_frequency`/`_resolution`, `set_despeckle`, `get_safety_state` |
+| `uc2.led` | `fill`, `set_mode`, `set_pattern` (rainbow/fire/…), `set_brightness` |
+| `uc2.galvo` | `set_position`/`goto`, `line_scan`, `raster_scan`, `stop`/`estop`, `get_status` |
+| `uc2.pid` | `set_setpoint`, `set_gains`, `set_enabled`, `get_actual` |
+| `uc2.encoder` | `get_position`, `get_velocity`, `set_zero` |
+| `uc2.digital` | `read_input`, `write_output` |
+| `uc2.analog` | `read_input`, `read_filtered`, `write_dac` |
+| `uc2.collision` | `configure`, `calibrate`, `get_mean`, `get_sigma` |
+| `uc2.state` | `get_uptime`, `get_cpu_temperature`, `get_enabled_modules`, `scan_nodes`, `set_node_id` |
+
+See [`CHANGELOG.md`](CHANGELOG.md) for the full 0.2.0 feature list and
+[`tests/test_new_features.py`](tests/test_new_features.py) for runnable examples
+of every new command.
 
 ## 5. CLI
 

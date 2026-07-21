@@ -1,8 +1,18 @@
 """
 UC2 CANopen Client — high-level Python interface for openUC2 hardware.
 
-Mirrors the UC2-REST API shape (uc2.motor, uc2.laser, uc2.led, uc2.state)
-but communicates over CAN bus via SDO instead of JSON-over-serial.
+Mirrors the UC2-REST API shape but communicates over CAN bus via SDO instead
+of JSON-over-serial. Device modules:
+    uc2.motor      stepper motion, homing, TMC config, soft/hard limits
+    uc2.laser      PWM intensity, frequency/resolution, despeckle
+    uc2.led        uniform colour, modes, animated patterns
+    uc2.galvo      goto, line/raster scan, status
+    uc2.pid        generic PID control loop
+    uc2.encoder    quadrature / magnetic encoder feedback
+    uc2.digital    digital inputs / outputs
+    uc2.analog     ADC inputs / DAC outputs
+    uc2.collision  baseline-deviation collision detector
+    uc2.state      firmware / system queries, node-id provisioning
 
 Usage:
     from uc2canopen import UC2Client
@@ -12,6 +22,7 @@ Usage:
     print(uc2.motor.get_position(axis=1))
     uc2.laser.set_value(channel=0, pwm=512)
     uc2.led.fill(r=255, g=0, b=0)
+    uc2.galvo.raster_scan(nx=128, ny=128)
     uc2.close()
 """
 
@@ -45,6 +56,7 @@ HB_BASE = 0x700
 class MotorState:
     position: int = 0
     running: bool = False
+    homing_status: int = 0   # 0=idle, 1=homing, 2=done, 3=timeout (TPDO1 byte 5, fw >= v0.2)
     last_update: float = 0.0
     seen: bool = False
 
@@ -72,7 +84,10 @@ class TpdoListener(can.Listener):
         self.motors: dict[tuple[int, int], MotorState] = {}   # (node_id, sub) → state
         self.nodes: dict[int, NodeInfo] = {}
         self._lock = threading.Lock()
-        self._callbacks: list[Callable] = []
+        self._callbacks: list[Callable] = []            # motor running→stopped edge
+        self._update_callbacks: list[Callable] = []     # every TPDO1 frame
+        self._homing_callbacks: list[Callable] = []     # homing_status transitions
+        self._heartbeat_callbacks: list[Callable] = []  # every heartbeat frame
 
     # Kept for API compatibility — no thread to start/stop now; the owning
     # UC2Client manages a shared can.Notifier instead.
@@ -90,6 +105,23 @@ class TpdoListener(can.Listener):
         """Register callback(node_id, sub_axis, position) for motor-done events."""
         self._callbacks.append(callback)
 
+    def on_motor_update(self, callback: Callable[[int, int, MotorState], None]):
+        """Register callback(node_id, sub_axis, MotorState) fired on every TPDO1 frame.
+
+        This is the generic position/state stream (typically 10-50 Hz per node);
+        throttle in the callback if needed.
+        """
+        self._update_callbacks.append(callback)
+
+    def on_homing_changed(self, callback: Callable[[int, int, int], None]):
+        """Register callback(node_id, sub_axis, homing_status) fired when the
+        homing phase changes (0=idle, 1=homing, 2=done, 3=timeout)."""
+        self._homing_callbacks.append(callback)
+
+    def on_heartbeat(self, callback: Callable[[int, NodeInfo], None]):
+        """Register callback(node_id, NodeInfo) fired on every heartbeat frame."""
+        self._heartbeat_callbacks.append(callback)
+
     def on_message_received(self, msg: can.Message) -> None:
         cob = msg.arbitration_id
         fc = cob & 0x780
@@ -97,37 +129,62 @@ class TpdoListener(can.Listener):
 
         if fc == TPDO1_BASE and len(msg.data) >= 5:
                 # TPDO1: i32 position (4 bytes) + u8 status (1 byte)
+                #        + u8 homing_status (1 byte, firmware >= v0.2 — optional)
             pos = struct.unpack_from("<i", msg.data, 0)[0]
             status = msg.data[4]
             running = bool(status & 0x01)
+            homing = msg.data[5] if len(msg.data) >= 6 else 0
 
             with self._lock:
                 key = (node_id, 0)  # sub 0 for now; multi-axis slaves use sub mapping
                 prev = self.motors.get(key)
                 was_running = prev.running if prev and prev.seen else False
+                prev_homing = prev.homing_status if prev and prev.seen else 0
 
-                self.motors[key] = MotorState(
+                state = MotorState(
                     position=pos,
                     running=running,
+                    homing_status=homing,
                     last_update=time.time(),
                     seen=True,
                 )
+                self.motors[key] = state
 
-                if was_running and not running:
-                    for cb in self._callbacks:
-                        try:
-                            cb(node_id, 0, pos)
-                        except Exception:
-                            pass
+            # Callbacks fire OUTSIDE the lock: the lock is non-reentrant, so a
+            # callback that reads back via get_motor()/get_node() would
+            # otherwise deadlock the notifier thread.
+            for cb in self._update_callbacks:
+                try:
+                    cb(node_id, 0, state)
+                except Exception:
+                    pass
+            if homing != prev_homing:
+                for cb in self._homing_callbacks:
+                    try:
+                        cb(node_id, 0, homing)
+                    except Exception:
+                        pass
+            if was_running and not running:
+                for cb in self._callbacks:
+                    try:
+                        cb(node_id, 0, pos)
+                    except Exception:
+                        pass
 
         elif fc == HB_BASE and len(msg.data) >= 1:
+            info = NodeInfo(
+                node_id=node_id,
+                nmt_state=msg.data[0],
+                last_heartbeat=time.time(),
+                seen=True,
+            )
             with self._lock:
-                self.nodes[node_id] = NodeInfo(
-                    node_id=node_id,
-                    nmt_state=msg.data[0],
-                    last_heartbeat=time.time(),
-                    seen=True,
-                )
+                self.nodes[node_id] = info
+            for cb in self._heartbeat_callbacks:
+                try:
+                    cb(node_id, info)
+                except Exception:
+                    pass
 
     def get_motor(self, node_id: int, sub: int = 0) -> Optional[MotorState]:
         with self._lock:
@@ -263,6 +320,81 @@ class Motor:
         nid = node_id or self.default_node
         self._sdo.write_u8(nid, OD.MOTOR_ENABLE, axis + 1, 1 if enabled else 0)
 
+    # Homing status codes reported via HOMING_STATUS (0x2016) / TPDO1 byte 5.
+    HOME_IDLE = 0
+    HOME_HOMING = 1
+    HOME_DONE = 2
+    HOME_TIMEOUT = 3
+
+    def get_homing_status(self, axis: int = 0, node_id: Optional[int] = None) -> int:
+        """Return homing phase for an axis (0=idle, 1=homing, 2=done, 3=timeout).
+
+        Prefers the TPDO cache (axis 0) if fresh, else falls back to an SDO read.
+        """
+        nid = node_id or self.default_node
+        if axis == 0:
+            state = self._listener.get_motor(nid, 0)
+            if state and state.seen and (time.time() - state.last_update) < 2.0:
+                return state.homing_status
+        return self._sdo.read_u8(nid, OD.HOMING_STATUS, axis + 1)
+
+    def wait_for_homed(self, axis: int = 0, node_id: Optional[int] = None,
+                       timeout: float = 30.0) -> bool:
+        """Block until homing completes. Returns True if HOME_DONE, False on timeout."""
+        nid = node_id or self.default_node
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            st = self.get_homing_status(axis, nid)
+            if st == self.HOME_DONE:
+                return True
+            if st == self.HOME_TIMEOUT:
+                return False
+            time.sleep(0.05)
+        return False
+
+    def set_soft_limits(self, axis: int = 0, min_pos: Optional[int] = None,
+                        max_pos: Optional[int] = None, node_id: Optional[int] = None):
+        """Set soft position limits (steps). The slave clips targets to this range."""
+        nid = node_id or self.default_node
+        sub = axis + 1
+        if min_pos is not None:
+            self._sdo.write_i32(nid, OD.MOTOR_MIN_POSITION, sub, min_pos)
+        if max_pos is not None:
+            self._sdo.write_i32(nid, OD.MOTOR_MAX_POSITION, sub, max_pos)
+
+    def set_acceleration(self, axis: int = 0, acceleration: int = 100000,
+                         node_id: Optional[int] = None):
+        """Set the acceleration profile (steps/s²) used for subsequent moves."""
+        nid = node_id or self.default_node
+        self._sdo.write_u32(nid, OD.MOTOR_ACCELERATION, axis + 1, acceleration)
+
+    def configure_tmc(self, axis: int = 0, microsteps: Optional[int] = None,
+                      rms_current_ma: Optional[int] = None,
+                      stallguard_threshold: Optional[int] = None,
+                      node_id: Optional[int] = None):
+        """Configure the TMC2209 driver for an axis (SDO-only, set-once)."""
+        nid = node_id or self.default_node
+        sub = axis + 1
+        if microsteps is not None:
+            self._sdo.write_u16(nid, OD.TMC_MICROSTEPS, sub, microsteps)
+        if rms_current_ma is not None:
+            self._sdo.write_u16(nid, OD.TMC_RMS_CURRENT, sub, rms_current_ma)
+        if stallguard_threshold is not None:
+            self._sdo.write_u8(nid, OD.TMC_STALLGUARD_THRESHOLD, sub, stallguard_threshold)
+
+    def set_hardlimit(self, axis: int = 0, enabled: bool = True,
+                      polarity: int = 0, node_id: Optional[int] = None):
+        """Enable/disable the hard-limit endstop for an axis and set its polarity."""
+        nid = node_id or self.default_node
+        sub = axis + 1
+        self._sdo.write_u8(nid, OD.HARDLIMIT_ENABLED, sub, 1 if enabled else 0)
+        self._sdo.write_u8(nid, OD.HARDLIMIT_POLARITY, sub, polarity & 0xFF)
+
+    def clear_hardlimit(self, axis: int = 0, node_id: Optional[int] = None):
+        """Clear a latched hard-limit trip on an axis."""
+        nid = node_id or self.default_node
+        self._sdo.write_u8(nid, OD.HARDLIMIT_COMMAND, axis + 1, 1)
+
 
 # ============================================================================
 # Laser controller
@@ -294,6 +426,36 @@ class Laser:
         for ch in range(num_channels):
             self.set_value(ch, pwm, node_id)
 
+    def get_max_value(self, channel: int = 0, node_id: Optional[int] = None) -> int:
+        """Read the full-scale PWM value (depends on PWM resolution)."""
+        nid = node_id or self.default_node
+        return self._sdo.read_u16(nid, OD.LASER_MAX_VALUE, channel + 1)
+
+    def set_pwm_frequency(self, channel: int = 0, frequency_hz: int = 5000,
+                          node_id: Optional[int] = None):
+        """Set the PWM carrier frequency (Hz). freq * 2^resolution must be <= APB clock."""
+        nid = node_id or self.default_node
+        self._sdo.write_u32(nid, OD.LASER_PWM_FREQUENCY, channel + 1, frequency_hz)
+
+    def set_pwm_resolution(self, channel: int = 0, bits: int = 10,
+                           node_id: Optional[int] = None):
+        """Set the PWM resolution in bits (full scale becomes 2^bits - 1)."""
+        nid = node_id or self.default_node
+        self._sdo.write_u8(nid, OD.LASER_PWM_RESOLUTION, channel + 1, bits & 0xFF)
+
+    def set_despeckle(self, channel: int = 0, period_us: int = 0, amplitude: int = 0,
+                      node_id: Optional[int] = None):
+        """Configure laser despeckle modulation. period_us=0 disables it."""
+        nid = node_id or self.default_node
+        sub = channel + 1
+        self._sdo.write_u32(nid, OD.LASER_DESPECKLE_PERIOD, sub, period_us)
+        self._sdo.write_u16(nid, OD.LASER_DESPECKLE_AMPLITUDE, sub, amplitude)
+
+    def get_safety_state(self, node_id: Optional[int] = None) -> int:
+        """Read the laser safety bitfield (bit0=interlock_ok, bit1=thermal_ok, bit2=enabled)."""
+        nid = node_id or self.default_node
+        return self._sdo.read_u8(nid, OD.LASER_SAFETY_STATE, 0)
+
 
 # ============================================================================
 # LED controller
@@ -323,6 +485,353 @@ class Led:
         nid = node_id or self.default_node
         self._sdo.write_u8(nid, OD.LED_BRIGHTNESS, 0, brightness & 0xFF)
 
+    # LED_ARRAY_MODE values (0x2200)
+    MODE_OFF = 0
+    MODE_ON = 1
+    MODE_LEFT = 2
+    MODE_RIGHT = 3
+    MODE_TOP = 4
+    MODE_BOTTOM = 5
+    MODE_INNER_RING = 6
+    MODE_OUTER_RING = 7
+    MODE_CUSTOM = 8
+    MODE_PATTERN = 9
+
+    def set_mode(self, mode: int, node_id: Optional[int] = None):
+        """Set the LED array mode (see Led.MODE_* constants)."""
+        nid = node_id or self.default_node
+        self._sdo.write_u8(nid, OD.LED_ARRAY_MODE, 0, mode & 0xFF)
+
+    # LED_PATTERN_ID values (0x2220)
+    PATTERN_NONE = 0
+    PATTERN_RAINBOW = 1
+    PATTERN_BREATHE = 2
+    PATTERN_CHASE = 3
+    PATTERN_FIRE = 4
+    PATTERN_SPARKLE = 5
+    PATTERN_HEATMAP = 6
+    PATTERN_SPIRAL = 7
+
+    def set_pattern(self, pattern_id: int = PATTERN_RAINBOW, speed: Optional[int] = None,
+                    node_id: Optional[int] = None):
+        """Start a built-in animated pattern (see Led.PATTERN_* constants).
+
+        Sets the pattern id, optional animation speed (fps) and switches the
+        array into pattern mode (mode 9).
+        """
+        nid = node_id or self.default_node
+        if speed is not None:
+            self._sdo.write_u16(nid, OD.LED_PATTERN_SPEED, 0, speed & 0xFFFF)
+        self._sdo.write_u8(nid, OD.LED_PATTERN_ID, 0, pattern_id & 0xFF)
+        self._sdo.write_u8(nid, OD.LED_ARRAY_MODE, 0, self.MODE_PATTERN)
+
+    def get_pixel_count(self, node_id: Optional[int] = None) -> int:
+        """Read the number of physical LEDs on this node."""
+        nid = node_id or self.default_node
+        return self._sdo.read_u16(nid, OD.LED_PIXEL_COUNT, 0)
+
+
+# ============================================================================
+# Galvo / scanner controller
+# ============================================================================
+
+class Galvo:
+    """
+    Galvo mirror scanner control — matches UC2-REST's /galvo_act API.
+
+    The slave's galvo command word (OD 0x2602) is a doorbell: write a nonzero
+    code, the slave executes it and clears the word back to CMD_IDLE. Stop has
+    its own nonzero code (CMD_STOP) so the self-clear is never mistaken for a
+    stop.
+
+    Positions are in DAC counts (0..4095 for a 12-bit MCP4822).
+    """
+
+    # Command word values (OD 0x2602) — shared master/slave protocol.
+    CMD_IDLE = 0
+    CMD_GOTO = 1
+    CMD_LINE = 2
+    CMD_RASTER = 3
+    CMD_STOP = 4
+    CMD_ESTOP = 5
+
+    # Camera trigger modes (OD 0x260F)
+    TRIGGER_OFF = 0
+    TRIGGER_PER_PIXEL = 1
+    TRIGGER_PER_LINE = 2
+    TRIGGER_PER_FRAME = 3
+
+    def __init__(self, sdo: SdoClient, default_node: int = NODE.GALVO):
+        self._sdo = sdo
+        self.default_node = default_node
+
+    def set_position(self, x: int, y: int, node_id: Optional[int] = None):
+        """Move the galvo to an absolute XY position (DAC counts) and issue GOTO."""
+        nid = node_id or self.default_node
+        self._sdo.write_i32(nid, OD.GALVO_TARGET_POSITION, 1, x)
+        self._sdo.write_i32(nid, OD.GALVO_TARGET_POSITION, 2, y)
+        self._sdo.write_u8(nid, OD.GALVO_COMMAND_WORD, 0, self.CMD_GOTO)
+
+    # Alias matching UC2-REST naming.
+    goto = set_position
+
+    def get_position(self, node_id: Optional[int] = None) -> tuple[int, int]:
+        """Read the current galvo XY position (DAC counts)."""
+        nid = node_id or self.default_node
+        x = self._sdo.read_i32(nid, OD.GALVO_ACTUAL_POSITION, 1)
+        y = self._sdo.read_i32(nid, OD.GALVO_ACTUAL_POSITION, 2)
+        return x, y
+
+    def raster_scan(self, x_min: int = 500, x_max: int = 3500,
+                    y_min: int = 500, y_max: int = 3500,
+                    nx: int = 256, ny: int = 256,
+                    sample_period_us: int = 1,
+                    pre_samples: int = 4, fly_samples: int = 16,
+                    line_settle_samples: int = 0,
+                    enable_trigger: int = TRIGGER_PER_PIXEL,
+                    bidirectional: bool = False,
+                    node_id: Optional[int] = None):
+        """
+        Configure and start a raster (full XY) scan.
+
+        Mirrors the firmware DeviceRouter::handleGalvoAct "config" path: writes
+        all scan parameters via SDO, computes x_step / y_step from the ranges and
+        step counts, then issues CMD_RASTER.
+
+        Args:
+            x_min/x_max/y_min/y_max: scan bounding box in DAC counts (0..4095)
+            nx/ny: number of steps along X (line) and Y (pixel/frame)
+            sample_period_us: dwell time per point (maps to GALVO_SCAN_SPEED)
+            pre_samples/fly_samples: blanking / flyback samples (t_pre/t_post)
+            line_settle_samples: settling samples after flyback
+            enable_trigger: camera trigger mode (see Galvo.TRIGGER_* constants)
+            bidirectional: True = scan alternate lines in reverse
+        """
+        nid = node_id or self.default_node
+        self._sdo.write_i32(nid, OD.GALVO_X_START, 0, x_min)
+        self._sdo.write_i32(nid, OD.GALVO_Y_START, 0, y_min)
+        self._sdo.write_u16(nid, OD.GALVO_N_STEPS_LINE, 0, nx)
+        self._sdo.write_u16(nid, OD.GALVO_N_STEPS_PIXEL, 0, ny)
+        self._sdo.write_u32(nid, OD.GALVO_SCAN_SPEED, 0, sample_period_us)
+        self._sdo.write_u16(nid, OD.GALVO_T_PRE_US, 0, pre_samples)
+        self._sdo.write_u16(nid, OD.GALVO_T_POST_US, 0, fly_samples)
+        self._sdo.write_u8(nid, OD.GALVO_CAMERA_TRIGGER_MODE, 0, enable_trigger)
+        # These two galvo slots are REUSED as transport containers by the firmware:
+        #   GALVO_D_STEPS_LINE  (0x2607) -> bidirectional (0/1)
+        #   GALVO_D_STEPS_PIXEL (0x2608) -> line_settle_samples
+        self._sdo.write_u16(nid, OD.GALVO_D_STEPS_LINE, 0, 1 if bidirectional else 0)
+        self._sdo.write_u16(nid, OD.GALVO_D_STEPS_PIXEL, 0, line_settle_samples)
+        # Compute per-step deltas the same way the firmware does.
+        if nx > 0:
+            self._sdo.write_i32(nid, OD.GALVO_X_STEP, 0, (x_max - x_min) // nx)
+        if ny > 0:
+            self._sdo.write_i32(nid, OD.GALVO_Y_STEP, 0, (y_max - y_min) // ny)
+        self._sdo.write_u8(nid, OD.GALVO_COMMAND_WORD, 0, self.CMD_RASTER)
+
+    def line_scan(self, x_min: int = 500, x_max: int = 3500,
+                  y: int = 2000, nx: int = 256,
+                  sample_period_us: int = 1,
+                  enable_trigger: int = TRIGGER_PER_PIXEL,
+                  node_id: Optional[int] = None):
+        """Configure and start a single-line (X sweep) scan at a fixed Y."""
+        nid = node_id or self.default_node
+        self._sdo.write_i32(nid, OD.GALVO_X_START, 0, x_min)
+        self._sdo.write_i32(nid, OD.GALVO_Y_START, 0, y)
+        self._sdo.write_u16(nid, OD.GALVO_N_STEPS_LINE, 0, nx)
+        self._sdo.write_u32(nid, OD.GALVO_SCAN_SPEED, 0, sample_period_us)
+        self._sdo.write_u8(nid, OD.GALVO_CAMERA_TRIGGER_MODE, 0, enable_trigger)
+        if nx > 0:
+            self._sdo.write_i32(nid, OD.GALVO_X_STEP, 0, (x_max - x_min) // nx)
+        self._sdo.write_u8(nid, OD.GALVO_COMMAND_WORD, 0, self.CMD_LINE)
+
+    def stop(self, node_id: Optional[int] = None):
+        """Stop any active scan / motion."""
+        nid = node_id or self.default_node
+        self._sdo.write_u8(nid, OD.GALVO_COMMAND_WORD, 0, self.CMD_STOP)
+
+    def estop(self, node_id: Optional[int] = None):
+        """Emergency stop."""
+        nid = node_id or self.default_node
+        self._sdo.write_u8(nid, OD.GALVO_COMMAND_WORD, 0, self.CMD_ESTOP)
+
+    def get_status(self, node_id: Optional[int] = None) -> dict:
+        """Read the galvo status word and decode it into named flags."""
+        nid = node_id or self.default_node
+        s = self._sdo.read_u8(nid, OD.GALVO_STATUS_WORD, 0)
+        return {
+            "raw": s,
+            "moving": bool(s & 0x01),
+            "scan_active": bool(s & 0x02),
+            "scan_complete": bool(s & 0x04),
+            "error": bool(s & 0x08),
+        }
+
+
+# ============================================================================
+# PID controller
+# ============================================================================
+
+class Pid:
+    """Generic PID control loop (e.g. focus stabilization) — OD 0x2700."""
+
+    def __init__(self, sdo: SdoClient, default_node: int = NODE.PID):
+        self._sdo = sdo
+        self.default_node = default_node
+
+    def set_setpoint(self, setpoint: int, node_id: Optional[int] = None):
+        nid = node_id or self.default_node
+        self._sdo.write_i32(nid, OD.PID_SETPOINT, 0, setpoint)
+
+    def get_actual(self, node_id: Optional[int] = None) -> int:
+        """Read the current process value."""
+        nid = node_id or self.default_node
+        return self._sdo.read_i32(nid, OD.PID_ACTUAL_VALUE, 0)
+
+    def set_gains(self, kp: Optional[int] = None, ki: Optional[int] = None,
+                  kd: Optional[int] = None, node_id: Optional[int] = None):
+        """Set PID gains (x1000 fixed point). Only provided gains are written."""
+        nid = node_id or self.default_node
+        if kp is not None:
+            self._sdo.write_u32(nid, OD.PID_KP, 0, kp)
+        if ki is not None:
+            self._sdo.write_u32(nid, OD.PID_KI, 0, ki)
+        if kd is not None:
+            self._sdo.write_u32(nid, OD.PID_KD, 0, kd)
+
+    def set_enabled(self, enabled: bool = True, node_id: Optional[int] = None):
+        nid = node_id or self.default_node
+        self._sdo.write_u8(nid, OD.PID_ENABLE, 0, 1 if enabled else 0)
+
+
+# ============================================================================
+# Encoder feedback
+# ============================================================================
+
+class Encoder:
+    """Quadrature / magnetic (AS5600) encoder feedback — OD 0x2340."""
+
+    def __init__(self, sdo: SdoClient, default_node: int = NODE.ENCODER):
+        self._sdo = sdo
+        self.default_node = default_node
+
+    def get_position(self, axis: int = 0, node_id: Optional[int] = None) -> int:
+        """Read encoder position in counts."""
+        nid = node_id or self.default_node
+        return self._sdo.read_i32(nid, OD.ENCODER_POSITION, axis + 1)
+
+    def get_velocity(self, axis: int = 0, node_id: Optional[int] = None) -> int:
+        """Read encoder velocity in counts/s."""
+        nid = node_id or self.default_node
+        return self._sdo.read_i32(nid, OD.ENCODER_VELOCITY, axis + 1)
+
+    def set_zero(self, axis: int = 0, offset: int = 0, node_id: Optional[int] = None):
+        """Set the zero offset applied to raw encoder counts."""
+        nid = node_id or self.default_node
+        self._sdo.write_i32(nid, OD.ENCODER_ZERO_OFFSET, axis + 1, offset)
+
+
+# ============================================================================
+# Digital I/O
+# ============================================================================
+
+class DigitalIO:
+    """Digital inputs / outputs (endstops, triggers, GPIOs) — OD 0x2300."""
+
+    def __init__(self, sdo: SdoClient, default_node: int = NODE.MOT_X):
+        self._sdo = sdo
+        self.default_node = default_node
+
+    def read_input(self, channel: int = 0, node_id: Optional[int] = None) -> int:
+        """Read one digital input channel (0/1)."""
+        nid = node_id or self.default_node
+        return self._sdo.read_u8(nid, OD.DIGITAL_INPUT_STATE, channel + 1)
+
+    def write_output(self, channel: int = 0, value: int = 0,
+                     node_id: Optional[int] = None):
+        """Set one digital output channel (0/1)."""
+        nid = node_id or self.default_node
+        self._sdo.write_u8(nid, OD.DIGITAL_OUTPUT_COMMAND, channel + 1, 1 if value else 0)
+
+
+# ============================================================================
+# Analog I/O (ADC in / DAC out)
+# ============================================================================
+
+class Analog:
+    """Analog inputs (ADC) and outputs (DAC) — OD 0x2310 / 0x2320."""
+
+    def __init__(self, sdo: SdoClient, default_node: int = NODE.MOT_X):
+        self._sdo = sdo
+        self.default_node = default_node
+
+    def read_input(self, channel: int = 0, node_id: Optional[int] = None) -> int:
+        """Read a raw ADC input value (counts)."""
+        nid = node_id or self.default_node
+        return self._sdo.read_u16(nid, OD.ANALOG_INPUT_VALUE, channel + 1)
+
+    def read_filtered(self, channel: int = 0, node_id: Optional[int] = None) -> int:
+        """Read an EWMA-filtered ADC input value (counts)."""
+        nid = node_id or self.default_node
+        return self._sdo.read_u16(nid, OD.ANALOG_INPUT_FILTERED, channel + 1)
+
+    def write_dac(self, channel: int = 0, value: int = 0,
+                  node_id: Optional[int] = None):
+        """Write a DAC output value (counts)."""
+        nid = node_id or self.default_node
+        self._sdo.write_u16(nid, OD.DAC_OUTPUT_VALUE, channel + 1, value)
+
+
+# ============================================================================
+# Collision detector (GPIO slave)
+# ============================================================================
+
+class Collision:
+    """
+    Baseline-deviation collision detector on the GPIO slave — OD 0x2330.
+
+    Two modes: AUTO (adaptive baseline + robust sigma z-score, parameter-free)
+    and MANUAL (fixed reference +/- threshold). The trip event rides TPDO2; the
+    rolling mean and sigma are polled via SDO on demand.
+    """
+
+    MODE_AUTO = 0
+    MODE_MANUAL = 1
+
+    def __init__(self, sdo: SdoClient, default_node: int = NODE.MOT_X):
+        self._sdo = sdo
+        self.default_node = default_node
+
+    def configure(self, reference: Optional[int] = None,
+                  threshold: Optional[int] = None,
+                  sensitivity: Optional[int] = None,
+                  mode: Optional[int] = None,
+                  node_id: Optional[int] = None):
+        """Configure the (MANUAL-mode) detector. Only provided fields are written."""
+        nid = node_id or self.default_node
+        if mode is not None:
+            self._sdo.write_u8(nid, OD.COLLISION_MODE, 0, mode)
+        if reference is not None:
+            self._sdo.write_u16(nid, OD.COLLISION_REFERENCE, 0, reference)
+        if threshold is not None:
+            self._sdo.write_u16(nid, OD.COLLISION_THRESHOLD, 0, threshold)
+        if sensitivity is not None:
+            self._sdo.write_u8(nid, OD.COLLISION_SENSITIVITY, 0, sensitivity)
+
+    def calibrate(self, node_id: Optional[int] = None):
+        """Calibrate: set reference := current rolling mean and persist it."""
+        nid = node_id or self.default_node
+        self._sdo.write_u8(nid, OD.COLLISION_COMMAND, 0, 1)
+
+    def get_mean(self, node_id: Optional[int] = None) -> int:
+        """Poll the rolling mean / adaptive baseline (ADC counts)."""
+        nid = node_id or self.default_node
+        return self._sdo.read_u16(nid, OD.COLLISION_MEAN, 0)
+
+    def get_sigma(self, node_id: Optional[int] = None) -> int:
+        """Poll the AUTO-mode robust noise scale (ADC counts)."""
+        nid = node_id or self.default_node
+        return self._sdo.read_u16(nid, OD.COLLISION_SIGMA, 0)
+
 
 # ============================================================================
 # State / system queries
@@ -342,9 +851,33 @@ class State:
     def get_free_heap(self, node_id: int) -> int:
         return self._sdo.read_u32(node_id, OD.FREE_HEAP_BYTES, 0)
 
+    def get_cpu_temperature(self, node_id: int) -> float:
+        """Read CPU temperature in °C (reported as centidegrees on the wire)."""
+        raw = self._sdo.read(node_id, OD.CPU_TEMPERATURE, 0, 2)
+        return struct.unpack("<h", raw)[0] / 100.0
+
+    def get_can_errors(self, node_id: int) -> int:
+        """Read the slave's cumulative CAN error counter."""
+        return self._sdo.read_u32(node_id, OD.CAN_ERROR_COUNTER, 0)
+
+    def get_enabled_modules(self, node_id: int) -> int:
+        """Read the enabled-modules bitmask (see firmware ENABLED_MODULES bits)."""
+        return self._sdo.read_u32(node_id, OD.ENABLED_MODULES, 0)
+
     def reboot(self, node_id: int):
         """Send reboot command to a slave."""
         self._sdo.write_u8(node_id, OD.REBOOT_COMMAND, 0, 1)
+
+    def set_node_id(self, node_id: int, new_node_id: int):
+        """Reassign a slave's CAN node id (1..127).
+
+        The slave persists the new id to NVS and performs a CANopen
+        communication reset. The SDO response is sent on the OLD id first; after
+        the reset the node reappears at `new_node_id`.
+        """
+        if not 1 <= new_node_id <= 127:
+            raise ValueError("new_node_id must be in 1..127")
+        self._sdo.write_u8(node_id, OD.COMMANDED_NODE_ID, 0, new_node_id)
 
     def scan_nodes(self, timeout: float = 3.0) -> list[int]:
         """Scan for online nodes by listening for heartbeats and TPDOs."""
@@ -468,6 +1001,12 @@ class UC2Client:
         self.motor = Motor(self._sdo, self._listener)
         self.laser = Laser(self._sdo)
         self.led = Led(self._sdo)
+        self.galvo = Galvo(self._sdo)
+        self.pid = Pid(self._sdo)
+        self.encoder = Encoder(self._sdo)
+        self.digital = DigitalIO(self._sdo)
+        self.analog = Analog(self._sdo)
+        self.collision = Collision(self._sdo)
         self.state = State(self._sdo, self._listener)
 
         # Expose the raw bus for advanced use

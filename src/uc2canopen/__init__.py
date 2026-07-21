@@ -9,6 +9,7 @@ Quick start:
     uc2.motor.wait_for_idle(axis=0, node_id=NODE.MOT_X)
     uc2.laser.set_value(channel=0, pwm=512, node_id=NODE.LASER_0)
     uc2.led.fill(r=255, g=0, b=0, node_id=NODE.LED_0)
+    uc2.galvo.raster_scan(nx=128, ny=128, node_id=NODE.GALVO)
     uc2.close()
 """
 
@@ -18,13 +19,47 @@ import logging
 # discarded unless the application configures a handler.
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
-from .client import UC2Client
+from .client import (
+    UC2Client,
+    Motor,
+    Laser,
+    Led,
+    Galvo,
+    Pid,
+    Encoder,
+    DigitalIO,
+    Analog,
+    Collision,
+    State,
+)
 from .od import OD, NODE
 from .sdo import SdoClient, SdoError
 from .waveshare_bus import WaveshareBus, find_waveshare_port
+from .aio import (
+    AsyncUC2Client,
+    MotorUpdateEvent,
+    MotorDoneEvent,
+    HomingChangedEvent,
+    HeartbeatEvent,
+)
 
 __all__ = [
+    "AsyncUC2Client",
+    "MotorUpdateEvent",
+    "MotorDoneEvent",
+    "HomingChangedEvent",
+    "HeartbeatEvent",
     "UC2Client",
+    "Motor",
+    "Laser",
+    "Led",
+    "Galvo",
+    "Pid",
+    "Encoder",
+    "DigitalIO",
+    "Analog",
+    "Collision",
+    "State",
     "OD",
     "NODE",
     "SdoClient",
@@ -33,4 +68,4 @@ __all__ = [
     "find_waveshare_port",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
