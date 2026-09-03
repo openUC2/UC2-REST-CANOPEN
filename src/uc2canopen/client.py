@@ -951,6 +951,7 @@ class UC2Client:
         interface: Optional[str] = None,
         channel: Optional[str] = None,
         log_level: int = logging.WARNING,
+        debug: bool = False
     ):
         # Configure the package-wide logger so all sub-modules (sdo, waveshare_bus)
         # honour the same level. The caller controls verbosity; we never install

@@ -265,7 +265,7 @@ def sniff(serial_port: str, can_bitrate: int, serial_baudrate: int = 2_000_000):
 
 if __name__ == "__main__":
     #SERIAL_PORT    = "/dev/cu.wchusbserial110"  # Waveshare USB-CAN-A port
-    SERIAL_PORT = "/dev/cu.usbserial-110"
+    SERIAL_PORT = "/dev/cu.usbserial-10"
     CAN_BITRATE    = 500_000                    # Must match the CAN network
     SERIAL_BAUDRATE = 2_000_000                 # Waveshare default
 

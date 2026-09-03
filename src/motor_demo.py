@@ -19,6 +19,8 @@ Usage:
 
     # Waveshare USB-CAN-A adapter instead:
     python src/motor_demo.py --interface waveshare --port /dev/ttyUSB0 --motor-node 11
+    python src/motor_demo.py --interface waveshare --port /dev/cu.usbserial-10 --motor-node 11    
+    python src/motor_demo.py --interface waveshare --port /dev/cu.wchusbserial10 --motor-node 11    
 """
 
 from __future__ import annotations
