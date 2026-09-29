@@ -37,6 +37,10 @@ class OD:
     MOTOR_MAX_POSITION      = 0x2009  # I32[4]  soft limit max
     MOTOR_JERK              = 0x200A  # U32[4]
     MOTOR_IS_FOREVER        = 0x200B  # U8[4]   continuous move
+    # strobed sweep position latch (TPDO3 = 0x380 + node: i32 position + u16 count)
+    MOTOR_SYNC_POSITION     = 0x200C  # I32[4]  steps latched at the last SYNC (ro)
+    MOTOR_SYNC_COUNT        = 0x200D  # U16[4]  SYNCs latched since enable (ro)
+    MOTOR_SYNC_LATCH_ENABLE = 0x200E  # U8[4]   1 = latch on SYNC + send TPDO3
 
     # ── Homing (0x2010-0x2016) ──
     HOMING_COMMAND          = 0x2010  # U8[4]   1=start
@@ -70,6 +74,11 @@ class OD:
     LASER_DESPECKLE_PERIOD   = 0x2104  # U32[4]  us (0=off)
     LASER_DESPECKLE_AMPLITUDE = 0x2105  # U16[4]
     LASER_SAFETY_STATE       = 0x2106  # U8
+    # strobed sweep flash: one flash per received SYNC
+    LASER_STROBE_ENABLE      = 0x2107  # U8[4]   1 = strobe on (PWM detached)
+    LASER_STROBE_DELAY_US    = 0x2108  # U32[4]  SYNC-to-flash delay, µs
+    LASER_STROBE_WIDTH_US    = 0x2109  # U32[4]  flash width, µs
+    LASER_STROBE_COUNT       = 0x210A  # U32[4]  flashes since enable (ro)
 
     # ── LED (0x2200-0x2221) ──
     # Note: 0x2210 and 0x2211 are DOMAIN/segmented — not expedited SDO.
@@ -232,6 +241,9 @@ _ENTRIES: list[ODEntry] = [
     ODEntry(0x2009, "motor_max_position",     "i", 4, 4, True),
     ODEntry(0x200A, "motor_jerk",             "I", 4, 4, True),
     ODEntry(0x200B, "motor_is_forever",       "B", 1, 4, True),
+    ODEntry(0x200C, "motor_sync_position",    "i", 4, 4, False),
+    ODEntry(0x200D, "motor_sync_count",       "H", 2, 4, False),
+    ODEntry(0x200E, "motor_sync_latch_enable", "B", 1, 4, True),
     # homing (0x2010-0x2015)
     ODEntry(0x2010, "homing_command",         "B", 1, 4, True),
     ODEntry(0x2011, "homing_speed",           "I", 4, 4, True),
@@ -261,6 +273,10 @@ _ENTRIES: list[ODEntry] = [
     ODEntry(0x2104, "laser_despeckle_period",   "I", 4, 4, True),
     ODEntry(0x2105, "laser_despeckle_amplitude","H", 2, 4, True),
     ODEntry(0x2106, "laser_safety_state",       "B", 1, 0, False),
+    ODEntry(0x2107, "laser_strobe_enable",      "B", 1, 4, True),
+    ODEntry(0x2108, "laser_strobe_delay_us",    "I", 4, 4, True),
+    ODEntry(0x2109, "laser_strobe_width_us",    "I", 4, 4, True),
+    ODEntry(0x210A, "laser_strobe_count",       "I", 4, 4, False),
     # led (0x2200-0x2221); 0x2210/2211 are DOMAIN/multi-byte — handle separately
     ODEntry(0x2200, "led_array_mode",         "B", 1, 0, True),
     ODEntry(0x2201, "led_brightness",         "B", 1, 0, True),

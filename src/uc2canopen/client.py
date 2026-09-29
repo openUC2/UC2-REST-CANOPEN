@@ -45,6 +45,8 @@ _log = logging.getLogger(__name__)
 
 # TPDO1 COB-ID base
 TPDO1_BASE = 0x180
+TPDO3_BASE = 0x380   # strobed-sweep position latch: i32 position + u16 count
+SYNC_COB_ID = 0x080
 HB_BASE = 0x700
 
 
@@ -88,6 +90,7 @@ class TpdoListener(can.Listener):
         self._update_callbacks: list[Callable] = []     # every TPDO1 frame
         self._homing_callbacks: list[Callable] = []     # homing_status transitions
         self._heartbeat_callbacks: list[Callable] = []  # every heartbeat frame
+        self._sync_position_callbacks: list[Callable] = []  # every TPDO3 latch frame
 
     # Kept for API compatibility — no thread to start/stop now; the owning
     # UC2Client manages a shared can.Notifier instead.
@@ -121,6 +124,13 @@ class TpdoListener(can.Listener):
     def on_heartbeat(self, callback: Callable[[int, NodeInfo], None]):
         """Register callback(node_id, NodeInfo) fired on every heartbeat frame."""
         self._heartbeat_callbacks.append(callback)
+
+    def on_sync_position(self, callback: Callable[[int, int, int], None]):
+        """Register callback(node_id, position_steps, sync_count) for TPDO3 latch frames.
+
+        Motor nodes send one per received SYNC while their latch (OD 0x200E) is on.
+        """
+        self._sync_position_callbacks.append(callback)
 
     def on_message_received(self, msg: can.Message) -> None:
         cob = msg.arbitration_id
@@ -170,6 +180,15 @@ class TpdoListener(can.Listener):
                         cb(node_id, 0, pos)
                     except Exception:
                         pass
+
+        elif fc == TPDO3_BASE and node_id and len(msg.data) >= 6:
+            # TPDO3: i32 latched position + u16 sync count (strobed sweep)
+            pos, count = struct.unpack_from("<iH", msg.data, 0)
+            for cb in self._sync_position_callbacks:
+                try:
+                    cb(node_id, pos, count)
+                except Exception:
+                    pass
 
         elif fc == HB_BASE and len(msg.data) >= 1:
             info = NodeInfo(
@@ -232,6 +251,20 @@ class Motor:
         self._sdo = sdo
         self._listener = listener
         self.default_node = default_node
+
+    def enable_sync_latch(self, axis: int = 0, enable: bool = True,
+                          node_id: Optional[int] = None) -> bool:
+        """Latch this node's position on every SYNC and send it in TPDO3 (0x380 + node).
+
+        Enabling writes 0 first so the node restarts its count at 1 for the next
+        SYNC (it polls the object every millisecond).
+        """
+        nid = node_id or self.default_node
+        sub = axis + 1
+        if enable:
+            self._sdo.write_u8(nid, OD.MOTOR_SYNC_LATCH_ENABLE, sub, 0)
+            time.sleep(0.01)
+        return bool(self._sdo.write_u8(nid, OD.MOTOR_SYNC_LATCH_ENABLE, sub, 1 if enable else 0))
 
     def move(self, axis: int = 0, position: int = 0, speed: int = 20000,
              acceleration: int = 0, is_absolute: bool = False,
@@ -442,6 +475,33 @@ class Laser:
         """Set the PWM resolution in bits (full scale becomes 2^bits - 1)."""
         nid = node_id or self.default_node
         self._sdo.write_u8(nid, OD.LASER_PWM_RESOLUTION, channel + 1, bits & 0xFF)
+
+    def configure_strobe(self, channel: int = 0, enable: bool = True, delay_us: int = 0,
+                         width_us: int = 20, node_id: Optional[int] = None) -> bool:
+        """Strobe this node channel: one flash per received SYNC, delay_us after it.
+
+        Delay and width are written before enable so the node never flashes with
+        stale values. The node applies the request from its main loop and writes
+        the outcome back (enable 0 when refused, clamped delay/width): read it with
+        get_strobe() a few tens of milliseconds later.
+        """
+        nid = node_id or self.default_node
+        sub = channel + 1
+        if enable:
+            self._sdo.write_u32(nid, OD.LASER_STROBE_DELAY_US, sub, int(delay_us))
+            self._sdo.write_u32(nid, OD.LASER_STROBE_WIDTH_US, sub, int(width_us))
+        return bool(self._sdo.write_u8(nid, OD.LASER_STROBE_ENABLE, sub, 1 if enable else 0))
+
+    def get_strobe(self, channel: int = 0, node_id: Optional[int] = None) -> dict:
+        """Read back {'enabled', 'delay_us', 'width_us', 'count'} of a strobe channel."""
+        nid = node_id or self.default_node
+        sub = channel + 1
+        return {
+            "enabled": bool(self._sdo.read_u8(nid, OD.LASER_STROBE_ENABLE, sub)),
+            "delay_us": self._sdo.read_u32(nid, OD.LASER_STROBE_DELAY_US, sub),
+            "width_us": self._sdo.read_u32(nid, OD.LASER_STROBE_WIDTH_US, sub),
+            "count": self._sdo.read_u32(nid, OD.LASER_STROBE_COUNT, sub),
+        }
 
     def set_despeckle(self, channel: int = 0, period_us: int = 0, amplitude: int = 0,
                       node_id: Optional[int] = None):
@@ -901,6 +961,16 @@ class State:
     def reset_node(self, node_id: int = 0):
         self.send_nmt(node_id, 0x81)
 
+    def send_sync(self):
+        """Send one CANopen SYNC (COB-ID 0x080, no data).
+
+        Bench tool for the strobed sweep: strobing illumination nodes flash and
+        latching motor nodes report their position on every SYNC. In a real
+        sweep the ESP32 master sends SYNC so the camera trigger is aligned.
+        """
+        msg = can.Message(arbitration_id=SYNC_COB_ID, data=b"", is_extended_id=False)
+        self._sdo.bus.send(msg)
+
 
 # ============================================================================
 # Main client — the public API
@@ -1012,6 +1082,15 @@ class UC2Client:
 
         # Expose the raw bus for advanced use
         self.bus = self._bus
+
+    # --- strobed sweep bench helpers ---------------------------------------
+    def send_sync(self):
+        """Send one CANopen SYNC (see State.send_sync)."""
+        self.state.send_sync()
+
+    def on_sync_position(self, callback):
+        """Register callback(node_id, position_steps, sync_count) for TPDO3 latch frames."""
+        self._listener.on_sync_position(callback)
 
     def close(self):
         """Shut down the notifier and close the CAN bus."""
