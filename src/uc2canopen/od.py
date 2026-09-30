@@ -133,8 +133,8 @@ class OD:
     JOYSTICK_DEADZONE          = 0x2403  # U16    (registry-only)
 
     # ── System (0x2500-0x250A) ──
-    FIRMWARE_VERSION        = 0x2500  # STRING[32]  (segmented read; not expedited)
-    BOARD_NAME              = 0x2501  # STRING[32]  (segmented read; not expedited)
+    FIRMWARE_VERSION        = 0x2500  # STRING[64]  UC2_FW_VERSION (segmented read; not expedited)
+    BOARD_NAME              = 0x2501  # STRING[64]  UC2_FW_IMAGE, image file name (segmented read)
     ENABLED_MODULES         = 0x2502  # U32  bitmask of active modules
     UPTIME_SECONDS          = 0x2503  # U32
     FREE_HEAP_BYTES         = 0x2504  # U32
